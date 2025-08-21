@@ -1,0 +1,23 @@
+{
+  "comic": {
+    "size": [704, 512],
+    "guidance_scale": 7.5,
+    "steps": 30,
+    "suffix": "klarer Comic-Stil, saubere Outlines, kräftige Farben, flächig, minimal shading, lineart",
+    "negative": "realistic photo, photorealistic, human faces, abstract pattern, text watermark, low quality, blurry"
+  },
+  "instagram": {
+    "size": [512, 512],
+    "guidance_scale": 7.5,
+    "steps": 30,
+    "suffix": "plakativer Poster-Look, starke Kontraste, trendige Farben, clean background",
+    "negative": "text watermark, frames, border, lowres, artifacts"
+  },
+  "kinderbuch": {
+    "size": [768, 1024],
+    "guidance_scale": 6.5,
+    "steps": 28,
+    "suffix": "weiche Pastellfarben, sanfte Konturen, freundlicher Kinderbuch-Stil, einfache Formen",
+    "negative": "scary, horror, gore, dark, noisy, cluttered, text watermark, photorealistic"
+  }
+}
