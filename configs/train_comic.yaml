@@ -1,0 +1,14 @@
+base_model: runwayml/stable-diffusion-v1-5
+output_dir: models/loras/comic_character
+train_images: data/comic_character/images
+resolution: 768
+caption_file: data/comic_character/captions.txt  # optional, sonst Dateinamen
+max_train_steps: 1200
+lr: 1e-4
+batch_size: 2
+lora_rank: 16
+lora_alpha: 16
+lora_target_modules: ["to_q","to_k","to_v","to_out.0","ff.net.0.proj","ff.net.2"]
+prompt_prefix: "comic style, clean lineart, bright flat colors"
+negative_prompt: "photorealistic, real human face, text watermark, noisy, cluttered"
+seed: 42
