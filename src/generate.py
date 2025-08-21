@@ -1,74 +1,118 @@
+# src/generate.py
+# Bild-Erzeugung mit Diffusers, Style-Config + optionaler Negativ-Prompt
+
 import os
-from PIL import Image
-from diffusers import StableDiffusionPipeline, DPMSolverMultistepScheduler
+from typing import List, Tuple, Dict, Any, Optional
+
 import torch
-from tqdm import trange
-from .utils import load_styles, ensure_dirs, now_tag, seed_everything, compose_prompt
+from diffusers import StableDiffusionPipeline, DPMSolverMultistepScheduler
+from PIL import Image
 
-MODEL_ID = "runwayml/stable-diffusion-v1-5"  # offen & stabil
+# flexible Imports (lokal / modulstart)
+try:
+    from .utils import load_styles, ensure_outdir
+except Exception:
+    from src.utils import load_styles, ensure_outdir
 
-def load_pipe(dtype=None, device=None):
-    if dtype is None:
-        dtype = torch.float16 if torch.cuda.is_available() else torch.float32
-    if device is None:
-        device = "cuda" if torch.cuda.is_available() else "cpu"
+# Ein globaler Pipeline-Cache, damit das Modell nicht jedes Mal neu geladen wird
+_PIPELINE = None
+_PIPELINE_MODEL_ID = None
 
+
+def _load_pipeline(model_id: str, dtype: torch.dtype) -> StableDiffusionPipeline:
+    """Lädt (oder cached) die SD-Pipeline."""
+    global _PIPELINE, _PIPELINE_MODEL_ID
+    if _PIPELINE is not None and _PIPELINE_MODEL_ID == model_id:
+        return _PIPELINE
+
+    device = "cuda" if torch.cuda.is_available() else "cpu"
     pipe = StableDiffusionPipeline.from_pretrained(
-        MODEL_ID, torch_dtype=dtype, use_safetensors=True
+        model_id,
+        torch_dtype=dtype,
+        safety_checker=None,
+        use_safetensors=True
     )
     pipe.scheduler = DPMSolverMultistepScheduler.from_config(pipe.scheduler.config)
     pipe = pipe.to(device)
-    if device == "cuda":
-        pipe.enable_attention_slicing()
+
+    _PIPELINE = pipe
+    _PIPELINE_MODEL_ID = model_id
     return pipe
 
-def generate(prompt: str, style: str="comic", steps:int|None=None,
-             guidance_scale:float|None=None, seed:int|None=None,
-             n:int=1, negative_prompt:str|None=None, out_dir="out"):
-    ensure_dirs()
+
+def _size_from_style(style_cfg: Dict[str, Any]) -> Tuple[int, int]:
+    """Liest Breite/Höhe aus style_cfg['size'] (z. B. [704, 512])."""
+    size = style_cfg.get("size", [704, 512])
+    if isinstance(size, (list, tuple)) and len(size) == 2:
+        return int(size[0]), int(size[1])
+    return 704, 512
+
+
+def generate(
+    prompt: str,
+    style: str,
+    steps: int = 30,
+    guidance_scale: float = 7.5,
+    seed: int = 0,
+    n: int = 1,
+    negative: Optional[str] = None,
+) -> Tuple[List[str], Dict[str, Any]]:
+    """
+    Erzeugt n Bilder und speichert sie als PNG unter out/pages/.
+    Gibt (pfade, meta) zurück.
+    """
     styles = load_styles()
-    cfg = styles[style]
+    if style not in styles:
+        raise ValueError(f"Unbekannter Stil '{style}'. Verfügbar: {list(styles.keys())}")
 
-    W, H = cfg["size"]
-    if steps is None: steps = cfg["steps"]
-    if guidance_scale is None: guidance_scale = cfg["guidance_scale"]
-    if negative_prompt is None: negative_prompt = cfg.get("negative","")
+    style_cfg = styles[style]
+    width, height = _size_from_style(style_cfg)
 
-    tag = now_tag()
-    seed, g = seed_everything(seed)
-    pipe = load_pipe()
+    # Style-Defaults fallbacken, falls UI sie nicht übergeben hat
+    steps = int(steps or style_cfg.get("steps", 30))
+    guidance_scale = float(guidance_scale or style_cfg.get("guidance_scale", 7.5))
+    if negative is None:
+        negative = style_cfg.get("negative", "")
 
-    final_prompt = compose_prompt(prompt, cfg.get("suffix",""))
-    paths = []
-    for i in trange(n, desc="render"):
-        img = pipe(
-            final_prompt,
-            negative_prompt=negative_prompt,
-            width=W, height=H,
+    # Modell-ID wählen (kannst du in styles.json auch pro Stil hinterlegen, sonst global)
+    model_id = style_cfg.get("model_id", "runwayml/stable-diffusion-v1-5")
+    dtype = torch.float16 if torch.cuda.is_available() else torch.float32
+    pipe = _load_pipeline(model_id, dtype=dtype)
+
+    # RNG/Seed
+    if seed and seed > 0:
+        generator = torch.Generator(device=pipe.device).manual_seed(int(seed))
+    else:
+        generator = torch.Generator(device=pipe.device)
+
+    ensure_outdir("out/pages")
+    paths: List[str] = []
+
+    for i in range(n):
+        out = pipe(
+            prompt=prompt,
+            negative_prompt=negative or "",
             num_inference_steps=steps,
             guidance_scale=guidance_scale,
-            generator=g
-        ).images[0]
-        path = os.path.join(out_dir, f"{style}_{tag}_{i+1:02d}.png")
+            width=width,
+            height=height,
+            generator=generator
+        )
+        img: Image.Image = out.images[0]
+        path = os.path.join("out", "pages", f"page_{style}_{i:02d}.png")
         img.save(path)
         paths.append(path)
 
-    return paths, {"seed": seed, "prompt": final_prompt, "style": style, "steps": steps, "guidance": guidance_scale}
-
-if __name__ == "__main__":
-    import argparse, json
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--prompt", required=True)
-    ap.add_argument("--style", default="comic", choices=["comic","instagram","kinderbuch"])
-    ap.add_argument("--steps", type=int, default=None)
-    ap.add_argument("--guidance", type=float, default=None)
-    ap.add_argument("--seed", type=int, default=0)
-    ap.add_argument("--n", type=int, default=1)
-    ap.add_argument("--out_dir", default="out")
-    args = ap.parse_args()
-
-    paths, meta = generate(
-        prompt=args.prompt, style=args.style, steps=args.steps,
-        guidance_scale=args.guidance, seed=args.seed, n=args.n, out_dir=args.out_dir
+    meta = dict(
+        prompt=prompt,
+        negative=negative,
+        style=style,
+        steps=steps,
+        guidance_scale=guidance_scale,
+        size=[width, height],
+        n=n,
+        seed=seed,
+        model_id=model_id,
+        device="cuda" if torch.cuda.is_available() else "cpu",
     )
-    print(json.dumps({"paths": paths, "meta": meta}, ensure_ascii=False, indent=2))
+    return paths, meta
