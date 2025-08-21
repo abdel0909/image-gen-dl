@@ -3,8 +3,8 @@
     "size": [704, 512],
     "guidance_scale": 7.5,
     "steps": 30,
-    "suffix": "klarer Comic-Stil, saubere Outlines, kräftige Farben, flächig, minimal shading, lineart",
-    "negative": "realistic photo, photorealistic, human faces, abstract pattern, text watermark, low quality, blurry"
+    "suffix": "klarer Comic-Stil, saubere Outlines, kräftige Farben, flächig, minimal shading",
+    "negative": "realistic photo, photorealistic, human faces, abstract pattern, text watermark"
   },
   "instagram": {
     "size": [512, 512],
@@ -17,7 +17,28 @@
     "size": [768, 1024],
     "guidance_scale": 6.5,
     "steps": 28,
-    "suffix": "weiche Pastellfarben, sanfte Konturen, freundlicher Kinderbuch-Stil, einfache Formen",
+    "suffix": "weiche Pastellfarben, sanfte Konturen, freundlicher Kinderbuch-Stil, einfache Szenen",
     "negative": "scary, horror, gore, dark, noisy, cluttered, text watermark, photorealistic"
+  },
+  "manga": {
+    "size": [704, 512],
+    "guidance_scale": 8.0,
+    "steps": 32,
+    "suffix": "schwarz-weiß Manga-Zeichnung, detaillierte Linien, dynamische Posen, japanischer Stil",
+    "negative": "color, photorealistic, painting, abstract, watermark"
+  },
+  "oilpaint": {
+    "size": [768, 768],
+    "guidance_scale": 7.0,
+    "steps": 35,
+    "suffix": "Ölgemälde, dicke Pinselstriche, klassische Kunst, warme Farbtöne",
+    "negative": "comic, cartoon, digital art, lowres, text watermark"
+  },
+  "watercolor": {
+    "size": [768, 1024],
+    "guidance_scale": 6.8,
+    "steps": 30,
+    "suffix": "Aquarell-Stil, zarte Pastellfarben, verwaschene Kanten, freundlicher Look",
+    "negative": "comic, manga, 3d, photorealistic, text watermark"
   }
 }
