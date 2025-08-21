@@ -1,0 +1,17 @@
+__pycache__/
+*.pyc
+ENV/
+.venv/
+.env
+
+# Outputs / caches
+out/**
+!out/.gitkeep
+cache/**
+logs/**
+
+# Models / weights
+models/**
+!models/.gitkeep
+*.ckpt
+*.safetensors
