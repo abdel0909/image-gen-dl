@@ -1,4 +1,4 @@
-base_model: stabilityai/stable-diffusion-xl-base-1.0
+base_model: /content/models/sdxl
 output_dir: models/loras/real_style
 train_images: data/real_style/images
 resolution: 1024
