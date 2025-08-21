@@ -1,118 +1,95 @@
 # src/generate.py
-# Bild-Erzeugung mit Diffusers, Style-Config + optionaler Negativ-Prompt
-
-import os
-from typing import List, Tuple, Dict, Any, Optional
-
+import os, time, json
+from PIL import Image
 import torch
 from diffusers import StableDiffusionPipeline, DPMSolverMultistepScheduler
-from PIL import Image
 
-# flexible Imports (lokal / modulstart)
-try:
-    from .utils import load_styles, ensure_outdir
-except Exception:
-    from src.utils import load_styles, ensure_outdir
+from .utils import load_styles, ensure_dir, now_tag
 
-# Ein globaler Pipeline-Cache, damit das Modell nicht jedes Mal neu geladen wird
-_PIPELINE = None
-_PIPELINE_MODEL_ID = None
+styles = load_styles()
 
-
-def _load_pipeline(model_id: str, dtype: torch.dtype) -> StableDiffusionPipeline:
-    """Lädt (oder cached) die SD-Pipeline."""
-    global _PIPELINE, _PIPELINE_MODEL_ID
-    if _PIPELINE is not None and _PIPELINE_MODEL_ID == model_id:
-        return _PIPELINE
-
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+def _build_pipe(model_id: str, dtype: torch.dtype, device: str, lora_path: str | None = None):
     pipe = StableDiffusionPipeline.from_pretrained(
         model_id,
         torch_dtype=dtype,
-        safety_checker=None,
-        use_safetensors=True
+        safety_checker=None
     )
     pipe.scheduler = DPMSolverMultistepScheduler.from_config(pipe.scheduler.config)
     pipe = pipe.to(device)
 
-    _PIPELINE = pipe
-    _PIPELINE_MODEL_ID = model_id
+    # LoRA optional laden
+    if lora_path and os.path.exists(lora_path):
+        try:
+            pipe.load_lora_weights(lora_path)
+            # Optional (schneller zur Laufzeit, kein Grad benötigt):
+            if hasattr(pipe, "fuse_lora"):
+                pipe.fuse_lora()
+            print(f"✅ LoRA geladen: {lora_path}")
+        except Exception as e:
+            print(f"⚠️ Konnte LoRA nicht laden ({lora_path}): {e}")
+
     return pipe
 
+def generate(prompt: str,
+             style: str = "comic",
+             steps: int | None = None,
+             guidance_scale: float | None = None,
+             seed: int = 0,
+             n: int = 1,
+             negative: str | None = None,
+             lora_path: str | None = None):
+    """Rendert n Bilder im angegebenen Stil. Optional mit LoRA."""
+    cfg = styles[style]
+    size = tuple(cfg["size"])
+    steps = steps or cfg.get("steps", 30)
+    guidance_scale = guidance_scale or cfg.get("guidance_scale", 7.5)
+    negative = (negative if negative is not None else cfg.get("negative", "")) or ""
+    model_id = cfg.get("model_id", "runwayml/stable-diffusion-v1-5")
 
-def _size_from_style(style_cfg: Dict[str, Any]) -> Tuple[int, int]:
-    """Liest Breite/Höhe aus style_cfg['size'] (z. B. [704, 512])."""
-    size = style_cfg.get("size", [704, 512])
-    if isinstance(size, (list, tuple)) and len(size) == 2:
-        return int(size[0]), int(size[1])
-    return 704, 512
-
-
-def generate(
-    prompt: str,
-    style: str,
-    steps: int = 30,
-    guidance_scale: float = 7.5,
-    seed: int = 0,
-    n: int = 1,
-    negative: Optional[str] = None,
-) -> Tuple[List[str], Dict[str, Any]]:
-    """
-    Erzeugt n Bilder und speichert sie als PNG unter out/pages/.
-    Gibt (pfade, meta) zurück.
-    """
-    styles = load_styles()
-    if style not in styles:
-        raise ValueError(f"Unbekannter Stil '{style}'. Verfügbar: {list(styles.keys())}")
-
-    style_cfg = styles[style]
-    width, height = _size_from_style(style_cfg)
-
-    # Style-Defaults fallbacken, falls UI sie nicht übergeben hat
-    steps = int(steps or style_cfg.get("steps", 30))
-    guidance_scale = float(guidance_scale or style_cfg.get("guidance_scale", 7.5))
-    if negative is None:
-        negative = style_cfg.get("negative", "")
-
-    # Modell-ID wählen (kannst du in styles.json auch pro Stil hinterlegen, sonst global)
-    model_id = style_cfg.get("model_id", "runwayml/stable-diffusion-v1-5")
+    device = "cuda" if torch.cuda.is_available() else "cpu"
     dtype = torch.float16 if torch.cuda.is_available() else torch.float32
-    pipe = _load_pipeline(model_id, dtype=dtype)
 
-    # RNG/Seed
+    pipe = _build_pipe(model_id, dtype, device, lora_path=lora_path)
+
     if seed and seed > 0:
-        generator = torch.Generator(device=pipe.device).manual_seed(int(seed))
+        g = torch.Generator(device=device).manual_seed(seed)
     else:
-        generator = torch.Generator(device=pipe.device)
+        g = torch.Generator(device=device)
 
-    ensure_outdir("out/pages")
-    paths: List[str] = []
+    outdir = "out/pages"
+    ensure_dir(outdir)
+    tag = now_tag()
+
+    rendered = []
+    meta = {
+        "prompt": prompt,
+        "negative": negative,
+        "style": style,
+        "size": size,
+        "steps": steps,
+        "guidance_scale": guidance_scale,
+        "seed": seed,
+        "n": n,
+        "model_id": model_id,
+        "lora_path": lora_path or ""
+    }
 
     for i in range(n):
-        out = pipe(
-            prompt=prompt,
-            negative_prompt=negative or "",
+        img = pipe(
+            prompt + " " + cfg.get("suffix", ""),
+            negative_prompt=negative,
             num_inference_steps=steps,
             guidance_scale=guidance_scale,
-            width=width,
-            height=height,
-            generator=generator
-        )
-        img: Image.Image = out.images[0]
-        path = os.path.join("out", "pages", f"page_{style}_{i:02d}.png")
-        img.save(path)
-        paths.append(path)
+            height=size[1], width=size[0],
+            generator=g
+        ).images[0]
 
-    meta = dict(
-        prompt=prompt,
-        negative=negative,
-        style=style,
-        steps=steps,
-        guidance_scale=guidance_scale,
-        size=[width, height],
-        n=n,
-        seed=seed,
-        model_id=model_id,
-        device="cuda" if torch.cuda.is_available() else "cpu",
-    )
-    return paths, meta
+        p = os.path.join(outdir, f"{tag}_{i:02d}.png")
+        img.save(p)
+        rendered.append(p)
+        print(f"💾 Gespeichert: {p}")
+
+    with open(os.path.join(outdir, f"{tag}_meta.json"), "w") as f:
+        json.dump(meta, f, ensure_ascii=False, indent=2)
+
+    return rendered, meta
