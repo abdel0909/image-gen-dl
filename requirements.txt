@@ -1,0 +1,9 @@
+torch
+transformers
+diffusers
+accelerate
+safetensors
+Pillow
+ipywidgets
+reportlab
+tqdm
