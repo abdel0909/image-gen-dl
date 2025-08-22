@@ -1,36 +1,17 @@
 # -*- coding: utf-8 -*-
 """
-Minimaler, robuster LoRA-Trainer für Stable Diffusion v1.5 (Diffusers).
-- Bildordner + optionale captions.txt (eine Zeile pro Bild: "filename.jpg\tdein prompt")
-- SD v1.5 als Basismodell (oder kompatible v1.x Modelle)
-- LoRA nur auf UNet-Attention, text encoder bleibt frozen
-- Mixed Precision (fp16) optional, automatisches Speichern von Checkpoints
+Minimaler, robuster LoRA-Trainer für SD v1.5 (Diffusers).
+- caption_file optional
+- robustes attach_lora (kompatibel zu verschiedenen diffusers-Versionen)
+- Checkpoint-Speicher alle N Schritte
 
-Config (YAML) Felder (Beispiel):
-base_model: runwayml/stable-diffusion-v1-5
-train_images: data/real_style/images
-caption_file: null                # oder "data/real_style/captions.txt"
-output_dir: runs/real_smoke
-resolution: 512
-max_train_steps: 120
-batch_size: 1
-gradient_accumulation: 1
-lr: 1.0e-4
-rank: 16
-seed: 123
-save_every_steps: 40
-mixed_precision: fp16             # "fp16" oder "no"
-prompt_prefix: ""                 # optionaler Prompt-Präfix, wenn keine Captions vorhanden
+Aufruf:
+  python src/train_lora.py --config configs/train_smoke.yaml
 """
 
-import os
-import math
-import json
-import time
-import random
-import argparse
-from types import SimpleNamespace
+import os, sys, math, json, time, argparse, random
 from pathlib import Path
+from types import SimpleNamespace
 
 import torch
 from torch import nn
@@ -40,280 +21,348 @@ from PIL import Image
 
 import yaml
 
-from diffusers import StableDiffusionPipeline
-from diffusers.models.attention_processor import LoRAAttnProcessor
-from diffusers.optimization import get_cosine_schedule_with_warmup
-
-
-# ========= Hilfsfunktionen =========
+# ====================== Utilities ======================
 
 def load_yaml_to_ns(path: str | Path) -> SimpleNamespace:
     with open(path, "r") as f:
-        data = yaml.safe_load(f)
+        data = yaml.safe_load(f) or {}
+    # Defaults (falls in YAML nicht vorhanden)
+    defaults = dict(
+        base_model="runwayml/stable-diffusion-v1-5",
+        train_images="data/real_style/images",
+        caption_file=None,
+        resolution=512,
+        max_train_steps=120,
+        batch_size=1,
+        gradient_accumulation=1,
+        lr=1e-4,
+        lora_rank=16,
+        output_dir="runs/real_lora",
+        prompt_prefix="",
+        negative_prompt="",
+        save_every_steps=40,
+        seed=123,
+    )
+    for k, v in defaults.items():
+        data.setdefault(k, v)
     return SimpleNamespace(**data)
-
-def set_seed(seed: int):
-    if seed is None:
-        return
-    random.seed(seed)
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
 
 def ensure_dir(p: str | Path):
     Path(p).mkdir(parents=True, exist_ok=True)
 
-def human_time(s):
-    m, s = divmod(int(s), 60)
-    h, m = divmod(m, 60)
-    if h: return f"{h:02d}:{m:02d}:{s:02d}"
-    return f"{m:02d}:{s:02d}"
+def set_seed(seed: int):
+    random.seed(seed); torch.manual_seed(seed); torch.cuda.manual_seed_all(seed)
 
+def print_kv(title, d: dict):
+    print(f"\n== {title} ==")
+    for k, v in d.items():
+        print(f"{k:>14}: {v}")
 
-# ========= LoRA an UNet hängen (ohne hidden_size/hidden_dim) =========
-def attach_lora(unet: nn.Module, rank: int = 16):
-    """
-    Hängt LoRA-Schichten an alle Attention-Module des UNet.
-    Übergibt nur 'rank' und bei cross-attn 'cross_attention_dim' (wenn bekannt).
-    Dadurch keine Konflikte mit hidden_size/hidden_dim.
-    """
-    procs = {}
-    # neuere diffusers: unet.attn_processors dict -> Namen enthalten ...attn1/attn2.processor
-    for name, attn in unet.attn_processors.items():
-        is_self = name.endswith("attn1.processor")
-        cross_dim = None
-        if not is_self:
-            # versuche cross-dim aus UNet-Config oder Attn-Modul
-            cross_dim = getattr(unet.config, "cross_attention_dim", None)
-            if cross_dim is None:
-                cross_dim = getattr(attn, "cross_attention_dim", None)
+# ====================== Dataset ======================
 
-        kwargs = {"rank": int(rank)}
-        if cross_dim is not None:
-            kwargs["cross_attention_dim"] = int(cross_dim)
+class ImageCaptionDataset(Dataset):
+    def __init__(self, image_dir: str | Path, caption_file: str | None, size: int, prompt_prefix: str = ""):
+        self.image_dir = Path(image_dir)
+        self.prompt_prefix = (prompt_prefix or "").strip()
+        self.images = []
 
-        procs[name] = LoRAAttnProcessor(**kwargs)
+        # Collect images
+        if self.image_dir.is_dir():
+            for p in sorted(self.image_dir.glob("*")):
+                if p.suffix.lower() in [".jpg", ".jpeg", ".png", ".webp"]:
+                    self.images.append(p)
 
-    unet.set_attn_processor(procs)
-    return unet
-
-
-# ========= Dataset =========
-
-class ImageCaptionFolder(Dataset):
-    """
-    Lädt Bilder aus einem Ordner. Optional captions.txt mit Zeilen:
-      <filename>\t<prompt text>
-    Wenn keine Caption gefunden -> fallback: prefix oder leeres Prompt.
-    """
-    def __init__(self, img_dir: Path, caption_file: Path | None, size: int = 512, prefix: str = ""):
-        self.img_dir = Path(img_dir)
-        self.size = int(size)
-        self.prefix = prefix or ""
-
-        exts = {".png", ".jpg", ".jpeg", ".webp"}
-        self.images = [p for p in self.img_dir.iterdir() if p.suffix.lower() in exts]
-        self.images.sort()
-
+        # Optional captions.txt (eine Zeile pro Bildname oder "prompt: ...")
         self.captions = {}
-        if caption_file and Path(caption_file).exists():
-            with open(caption_file, "r", encoding="utf-8") as f:
-                for line in f:
-                    line = line.strip()
-                    if not line:
-                        continue
-                    if "\t" in line:
-                        fname, cap = line.split("\t", 1)
-                    elif "," in line:
-                        # toleranter: CSV-artig
-                        fname, cap = line.split(",", 1)
-                    else:
-                        # nur caption? dann gilt für alle -> selten sinnvoll
-                        fname, cap = "", line
-                    if fname:
-                        self.captions[fname] = cap
-                    else:
-                        # globaler fallback
-                        self.prefix = cap
+        if caption_file:
+            cap_path = Path(caption_file)
+            if cap_path.exists():
+                with open(cap_path, "r", encoding="utf-8") as f:
+                    for line in f:
+                        line = line.strip()
+                        if not line:
+                            continue
+                        # Formate unterstützen:
+                        # "IMG_0001.jpg: prompt text"
+                        # oder nur "prompt text" (dann global)
+                        if ":" in line:
+                            name, cap = line.split(":", 1)
+                            self.captions[name.strip()] = cap.strip()
+                        else:
+                            # globale Fallback-Caption, wenn kein Bild-spezifischer Eintrag
+                            self.captions["*"] = line.strip()
 
         self.tf = transforms.Compose([
-            transforms.Resize(self.size, interpolation=transforms.InterpolationMode.BILINEAR, antialias=True),
-            transforms.CenterCrop(self.size),
-            transforms.ToTensor(),
-            transforms.Normalize([0.5], [0.5])
+            transforms.Resize(size, interpolation=transforms.InterpolationMode.BICUBIC),
+            transforms.CenterCrop(size),
+            transforms.ToTensor(),                    # [0,1]
+            transforms.Normalize([0.5], [0.5])        # [-1,1]
         ])
 
     def __len__(self):
         return len(self.images)
 
+    def _caption_for(self, name: str):
+        if name in self.captions:
+            c = self.captions[name]
+        else:
+            c = self.captions.get("*", "")
+        c = c or ""  # None -> ""
+        if self.prompt_prefix:
+            # z. B. "natural light, candid, instagram photo"
+            if c:
+                return f"{self.prompt_prefix}, {c}"
+            return self.prompt_prefix
+        return c
+
     def __getitem__(self, idx):
         img_path = self.images[idx]
         img = Image.open(img_path).convert("RGB")
-        pixel_values = self.tf(img)
-
-        # Caption bestimmen
-        cap = self.captions.get(img_path.name, "").strip()
-        if not cap:
-            cap = self.prefix
-        # letzter Fallback: neutrales Prompt (damit Textencoder nicht leer ist)
-        if not cap:
-            cap = "a photo"
-
+        pixel = self.tf(img)
+        caption = self._caption_for(img_path.name)
         return {
-            "pixel_values": pixel_values,
-            "caption": cap,
+            "pixel_values": pixel,
+            "prompt": caption,
         }
 
+# ====================== Diffusers / SD v1.5 ======================
 
-# ========= Train =========
+def import_lora_class():
+    """
+    Liefert (LoRAAttnProcessor, save_attn_procs_fct) robust für verschiedene diffusers-Versionen.
+    """
+    try:
+        # Neuere diffusers
+        from diffusers.models.attention_processor import LoRAAttnProcessor
+        def saver(unet, out):
+            # existiert in neueren diffusers
+            try:
+                unet.save_attn_procs(out, safe_serialization=True)
+            except Exception:
+                # Fallback: rohes state_dict
+                sd = {}
+                for n, m in unet.attn_processors.items():
+                    if isinstance(m, LoRAAttnProcessor):
+                        for k, v in m.state_dict().items():
+                            sd[f"{n}.{k}"] = v
+                try:
+                    from safetensors.torch import save_file
+                    save_file(sd, str(Path(out) / "lora.safetensors"))
+                except Exception:
+                    torch.save(sd, str(Path(out) / "lora.bin"))
+        return LoRAAttnProcessor, saver
+    except Exception:
+        # Ältere diffusers
+        from diffusers.models.lora import LoRAAttnProcessor
+        def saver(unet, out):
+            # kein save_attn_procs in alten Versionen
+            sd = {}
+            for n, m in unet.attn_processors.items():
+                if isinstance(m, LoRAAttnProcessor):
+                    for k, v in m.state_dict().items():
+                        sd[f"{n}.{k}"] = v
+            try:
+                from safetensors.torch import save_file
+                save_file(sd, str(Path(out) / "lora.safetensors"))
+            except Exception:
+                torch.save(sd, str(Path(out) / "lora.bin"))
+        return LoRAAttnProcessor, saver
+
+def load_pipeline(base_model: str, device: str = "cuda"):
+    from diffusers import StableDiffusionPipeline, DPMSolverMultistepScheduler
+    pipe = StableDiffusionPipeline.from_pretrained(
+        base_model,
+        torch_dtype=torch.float16 if device == "cuda" else torch.float32,
+        safety_checker=None,
+    )
+    pipe.scheduler = DPMSolverMultistepScheduler.from_config(pipe.scheduler.config)
+    pipe.to(device)
+    # Safety Checker deaktivieren (Training)
+    pipe.safety_checker = None
+    return pipe
+
+# ====================== LoRA robust anhängen ======================
+
+def _hidden_from_attn(attn) -> int | None:
+    # Versuche verschiedene Felder/Module
+    for attr in ("to_q", "to_k", "to_v", "to_out"):
+        mod = getattr(attn, attr, None)
+        if mod is not None and hasattr(mod, "in_features"):
+            return int(mod.in_features)
+    # Alternativ: head_dim * heads
+    if hasattr(attn, "head_dim") and hasattr(attn, "heads"):
+        try:
+            return int(attn.head_dim) * int(attn.heads)
+        except Exception:
+            pass
+    # Letzer Fallback: None
+    return None
+
+def attach_lora(unet, rank: int):
+    """
+    Hängt LoRA an alle Attention-Module.
+    Kompatibel zu diffusers-Versionen mit hidden_dim ODER hidden_size ODER nur rank.
+    """
+    LoRAAttnProcessor, _ = import_lora_class()
+
+    procs = {}
+    for name, attn in unet.attn_processors.items():
+        # self-attention hat keine Cross-Dim
+        cross_dim = None if name.endswith("attn1.processor") else getattr(unet.config, "cross_attention_dim", None)
+        hidden = _hidden_from_attn(attn)
+
+        # Konstruiere kwargs robust
+        tried = []
+        for kwargs in (
+            {"hidden_dim": hidden, "cross_attention_dim": cross_dim, "rank": rank},
+            {"hidden_size": hidden, "cross_attention_dim": cross_dim, "rank": rank},
+            {"rank": rank},  # minimal
+        ):
+            try:
+                procs[name] = LoRAAttnProcessor(**{k: v for k, v in kwargs.items() if v is not None})
+                break
+            except TypeError as e:
+                tried.append(str(e))
+        else:
+            # Wenn alle Versuche scheitern, klare Meldung
+            msg = "\n".join(tried)
+            raise RuntimeError(f"LoRAAttnProcessor konnte nicht erstellt werden für '{name}'. Versuche:\n{msg}")
+
+    unet.set_attn_processor(procs)
+
+def lora_parameters(unet):
+    for _, module in unet.attn_processors.items():
+        # Nur LoRA-Parameter trainieren
+        for n, p in module.named_parameters():
+            if "lora_" in n and p.requires_grad:
+                yield p
+
+# ====================== Text + Latents ======================
+
+def encode_text(pipe, prompts: list[str]):
+    tok = pipe.tokenizer(
+        prompts,
+        padding="max_length",
+        max_length=pipe.tokenizer.model_max_length,
+        truncation=True,
+        return_tensors="pt",
+    )
+    input_ids = tok.input_ids.to(pipe.device)
+    with torch.no_grad():
+        enc = pipe.text_encoder(input_ids)[0]
+    return enc
+
+@torch.no_grad()
+def encode_images_to_latents(pipe, pixels: torch.Tensor):
+    # pixels: (B,3,H,W) in [-1,1]
+    pixels = pixels.to(pipe.device, dtype=pipe.vae.dtype)
+    latents = pipe.vae.encode(pixels).latent_dist.sample()
+    latents = latents * 0.18215  # SD v1.5 scaling
+    return latents
+
+# ====================== Training ======================
 
 def train(cfg: SimpleNamespace):
-    t0 = time.time()
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    mp = str(getattr(cfg, "mixed_precision", "no")).lower()
-    use_fp16 = (mp == "fp16" and device == "cuda")
+    set_seed(int(cfg.seed))
 
-    set_seed(getattr(cfg, "seed", None))
-
-    print("\n== Konfiguration ==")
-    print(json.dumps({
-        "base_model": cfg.base_model,
-        "image_dir": cfg.train_images,
-        "caption_file": getattr(cfg, "caption_file", None) or "(keine)",
-        "output_dir": cfg.output_dir,
-        "resolution": cfg.resolution,
-        "steps": cfg.max_train_steps,
-        "batch_size": cfg.batch_size,
-        "grad_acc": cfg.gradient_accumulation,
-        "lr": cfg.lr,
-        "rank": cfg.rank,
-        "device": device,
-        "fp16": use_fp16,
-    }, indent=2, ensure_ascii=False))
-
-    img_dir = Path(cfg.train_images)
-    ensure_dir(img_dir)
     ensure_dir(cfg.output_dir)
+    # Config-Kopie ablegen (repro)
+    with open(Path(cfg.output_dir) / "config_used.yaml", "w") as f:
+        yaml.safe_dump(vars(cfg), f, sort_keys=False)
 
-    # ===== Pipeline laden =====
-    dtype = torch.float16 if use_fp16 else torch.float32
-    pipe = StableDiffusionPipeline.from_pretrained(
-        cfg.base_model,
-        torch_dtype=dtype,
-        safety_checker=None
-    )
-    pipe.to(device)
+    # Daten
+    ds = ImageCaptionDataset(cfg.train_images, cfg.caption_file, cfg.resolution, cfg.prompt_prefix)
+    if len(ds) == 0:
+        raise RuntimeError(f"Dataset leer: {cfg.train_images}")
+    dl = DataLoader(ds, batch_size=cfg.batch_size, shuffle=True, drop_last=True, num_workers=0)
 
-    # Text-Encoder & VAE bleiben frozen
+    # Pipeline
+    pipe = load_pipeline(cfg.base_model, device=device)
+    pipe.unet.requires_grad_(False)
     pipe.text_encoder.requires_grad_(False)
     pipe.vae.requires_grad_(False)
 
-    # ===== LoRA an UNet hängen =====
-    pipe.unet = attach_lora(pipe.unet, rank=int(cfg.rank))
+    # LoRA anhängen
+    attach_lora(pipe.unet, rank=int(cfg.lora_rank))
+    for p in lora_parameters(pipe.unet):
+        p.requires_grad_(True)
 
-    # nur LoRA-Parameter trainieren
-    def lora_params(module):
-        for n, p in module.named_parameters():
-            if "lora" in n and p.requires_grad:
-                yield p
+    # Optimizer
+    trainable = list(lora_parameters(pipe.unet))
+    if len(trainable) == 0:
+        raise RuntimeError("Keine trainierbaren LoRA-Parameter gefunden.")
+    opt = torch.optim.AdamW(trainable, lr=float(cfg.lr))
 
-    opt = torch.optim.AdamW(lora_params(pipe.unet), lr=float(cfg.lr))
+    noise_scheduler = pipe.scheduler
 
-    # ===== Dataset & Loader =====
-    ds = ImageCaptionFolder(
-        img_dir=img_dir,
-        caption_file=getattr(cfg, "caption_file", None),
-        size=int(cfg.resolution),
-        prefix=getattr(cfg, "prompt_prefix", "")
-    )
-    if len(ds) == 0:
-        raise RuntimeError(f"Keine Trainingsbilder in {img_dir} gefunden.")
-
-    dl = DataLoader(ds, batch_size=int(cfg.batch_size), shuffle=True, num_workers=2, pin_memory=(device == "cuda"))
-
-    # ===== Scheduler =====
-    num_update_steps_per_epoch = math.ceil(len(dl) / int(cfg.gradient_accumulation))
-    max_train_steps = int(cfg.max_train_steps)
-    lr_scheduler = get_cosine_schedule_with_warmup(
-        optimizer=opt,
-        num_warmup_steps=max(1, max_train_steps // 20),
-        num_training_steps=max_train_steps
-    )
-
-    scaler = torch.cuda.amp.GradScaler(enabled=use_fp16)
-
-    # ===== Trainings-Loop =====
-    pipe.unet.train()
+    print_kv("Config", dict(
+        base_model=cfg.base_model,
+        image_dir=cfg.train_images,
+        caption_file=("keine" if not cfg.caption_file else cfg.caption_file),
+        output_dir=cfg.output_dir,
+        resolution=cfg.resolution,
+        steps=cfg.max_train_steps,
+        batch_size=cfg.batch_size,
+        grad_acc=cfg.gradient_accumulation,
+        lr=cfg.lr,
+        rank=cfg.lora_rank,
+        device=device,
+        Trainingsbilder=len(ds),
+    ))
 
     global_step = 0
-    save_every = int(getattr(cfg, "save_every_steps", 100))
+    pipe.unet.train()
 
-    print("\n== Training startet ==")
-    last_log = time.time()
+    def save_ckpt(tag: str):
+        # versucht safetensors, sonst .bin
+        stamp = f"step_{global_step:06d}_{tag}"
+        out = Path(cfg.output_dir) / stamp
+        ensure_dir(out)
+        _, saver = import_lora_class()
+        saver(pipe.unet, out)
+        print(f"[💾] Checkpoint gespeichert → {out}")
 
-    while global_step < max_train_steps:
-        for batch in dl:
-            global_step += 1
-            pixel_values = batch["pixel_values"].to(device, dtype=dtype)
-            prompts = batch["caption"]
+    running_loss = 0.0
+    for step in range(int(cfg.max_train_steps)):
+        for _ in range(int(cfg.gradient_accumulation)):
+            batch = next(iter(dl))  # einfacher: frisches Minibatch pro Accu-Step
+            pixels = batch["pixel_values"]  # (B,3,H,W)
+            prompts = batch["prompt"]
+            if isinstance(prompts, str):
+                prompts = [prompts] * pixels.size(0)
+            # Text
+            enc_hid = encode_text(pipe, prompts)
+            # Latents
+            latents = encode_images_to_latents(pipe, pixels)
 
-            # Text-Encoder
-            text_inputs = pipe.tokenizer(
-                list(prompts),
-                padding="max_length",
-                max_length=pipe.tokenizer.model_max_length,
-                truncation=True,
-                return_tensors="pt"
-            )
-            input_ids = text_inputs.input_ids.to(device)
-            with torch.no_grad():
-                encoder_hidden_states = pipe.text_encoder(input_ids)[0]
-
-            # VAE -> Latents
-            with torch.no_grad():
-                latents = pipe.vae.encode(pixel_values).latent_dist.sample() * 0.18215
-
-            # Noise + timesteps
+            # Noise
             noise = torch.randn_like(latents)
-            timesteps = torch.randint(0, pipe.scheduler.config.num_train_timesteps, (latents.shape[0],), device=device).long()
-            noisy_latents = pipe.scheduler.add_noise(latents, noise, timesteps)
+            timesteps = torch.randint(0, noise_scheduler.config.num_train_timesteps, (latents.shape[0],), device=device).long()
+            noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
 
-            # Vorwärts (UNet vorhersagt Rauschen)
-            with torch.cuda.amp.autocast(enabled=use_fp16):
-                model_pred = pipe.unet(noisy_latents, timesteps, encoder_hidden_states).sample
-                loss = nn.functional.mse_loss(model_pred.float(), noise.float(), reduction="mean")
+            # UNet vorwärts
+            model_pred = pipe.unet(noisy_latents, timesteps, encoder_hidden_states=enc_hid).sample
+            loss = nn.functional.mse_loss(model_pred.float(), noise.float(), reduction="mean") / float(cfg.gradient_accumulation)
+            loss.backward()
+            running_loss += loss.item()
 
-            # Rückwärts
-            scaler.scale(loss / int(cfg.gradient_accumulation)).backward()
+        opt.step(); opt.zero_grad(set_to_none=True)
+        global_step += 1
 
-            if global_step % int(cfg.gradient_accumulation) == 0:
-                scaler.step(opt)
-                scaler.update()
-                opt.zero_grad(set_to_none=True)
-                lr_scheduler.step()
+        if global_step % 10 == 0:
+            avg = running_loss / 10.0
+            print(f"step {global_step:05d} | loss={avg:.6f}")
+            running_loss = 0.0
 
-            # Logging
-            if time.time() - last_log > 5:
-                print(f"step {global_step:05d}/{max_train_steps}  loss={loss.item():.4f}")
-                last_log = time.time()
+        if int(cfg.save_every_steps) > 0 and (global_step % int(cfg.save_every_steps) == 0):
+            save_ckpt("auto")
 
-            # Checkpoint speichern
-            if global_step % save_every == 0 or global_step == max_train_steps:
-                ckpt_dir = Path(cfg.output_dir) / f"step_{global_step:05d}"
-                ensure_dir(ckpt_dir)
-                # nur LoRA (Attention Processors) sichern:
-                pipe.unet.save_attn_procs(ckpt_dir)
-                # Config mitschreiben
-                with open(ckpt_dir / "train_config.json", "w", encoding="utf-8") as f:
-                    json.dump(vars(cfg), f, indent=2, ensure_ascii=False)
-                print(f"💾 Checkpoint gespeichert: {ckpt_dir}")
+    # Final speichern
+    save_ckpt("final")
+    print("\n✅ Training fertig.")
 
-            if global_step >= max_train_steps:
-                break
-
-    print(f"\n✅ Training fertig in {human_time(time.time()-t0)}. Letzte Stufe: {global_step}.")
-
-
-# ========= CLI =========
+# ====================== CLI ======================
 
 def main():
     ap = argparse.ArgumentParser()
@@ -321,25 +370,6 @@ def main():
     args = ap.parse_args()
 
     cfg = load_yaml_to_ns(args.config)
-
-    # Defaults setzen / absichern
-    defaults = dict(
-        caption_file=None,
-        prompt_prefix="",
-        resolution=512,
-        max_train_steps=200,
-        batch_size=1,
-        gradient_accumulation=1,
-        lr=1e-4,
-        rank=16,
-        save_every_steps=100,
-        mixed_precision="fp16",
-        seed=123
-    )
-    for k, v in defaults.items():
-        if not hasattr(cfg, k) or getattr(cfg, k) is None:
-            setattr(cfg, k, v)
-
     ensure_dir(cfg.output_dir)
     train(cfg)
 
