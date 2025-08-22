@@ -1,14 +1,27 @@
-base_model: /content/models/sdxl
-output_dir: models/loras/real_style
-train_images: data/real_style/images
-resolution: 1024
-caption_file: data/real_style/captions.txt      # optional
+# Basismodell: SD v1.5 (schnell & stabil in Colab/T4)
+base_model: runwayml/stable-diffusion-v1-5
+
+# Daten/Output
+train_images: data/real_style/images        # Ordner mit JPG/PNG
+caption_file: data/real_style/captions.txt  # optional, 1 Zeile pro Bild
+output_dir: runs/real_lora                  # hier entstehen Checkpoints
+
+# Training
+resolution: 512
 max_train_steps: 800
-lr: 8.0e-5
 batch_size: 1
+gradient_accumulation: 2
+learning_rate: 1.0e-4
+mixed_precision: fp16
+lr_scheduler: cosine
+save_every_steps: 200
+
+# LoRA
 lora_rank: 16
 lora_alpha: 16
 lora_target_modules: ["to_q","to_k","to_v","to_out.0","ff.net.0.proj","ff.net.2"]
+
+# Prompts
 prompt_prefix: "natural light, candid, shallow depth of field, instagram photo"
-negative_prompt: "cartoon, illustration, painting, overprocessed, watermark"
+negative_prompt: "cartoon, illustration, painting, overprocessed, watermark, text"
 seed: 123
