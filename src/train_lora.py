@@ -1,172 +1,197 @@
-import os, re, json, math, pathlib, random
-from dataclasses import dataclass
-from typing import Optional
+# src/train_lora.py  —  vereinfachtes, robustes LoRA-Training (Diffusers)
+# Ersetzt komplett deine bestehende train_lora.py
+
+import os, math, time, json, argparse, random
+from pathlib import Path
+from types import SimpleNamespace as SN
+
 import torch
+from torch import nn
 from torch.utils.data import Dataset, DataLoader
 from PIL import Image
-from diffusers import StableDiffusionPipeline
-from diffusers.optimization import get_scheduler
-from huggingface_hub import HfApi, HfFolder, whoami
+import yaml
 
-# ----------------- Config -----------------
-@dataclass
-class Cfg:
-    base_model: str
-    train_images: str
-    caption_file: Optional[str]
-    output_dir: str
-    resolution: int = 512
-    max_train_steps: int = 800
-    batch_size: int = 1
-    gradient_accumulation: int = 2
-    learning_rate: float = 1e-4
-    mixed_precision: str = "fp16"
-    lr_scheduler: str = "cosine"
-    save_every_steps: int = 200
-    lora_rank: int = 16
-    lora_alpha: int = 16
-    lora_target_modules: tuple = ("to_q","to_k","to_v","to_out.0","ff.net.0.proj","ff.net.2")
-    prompt_prefix: str = ""
-    negative_prompt: str = ""
-    seed: int = 123
+from diffusers import StableDiffusionPipeline, AutoencoderKL, DDPMScheduler
+from diffusers.loaders import AttnProcsLayers
+from diffusers.models.attention_processor import LoRAAttnProcessor
+from transformers import CLIPTokenizer, CLIPTextModel
 
-def load_yaml(path):
-    import yaml
+# ----------------------------
+# Utils
+# ----------------------------
+
+def load_yaml(path: str) -> SN:
     with open(path, "r") as f:
-        return Cfg(**yaml.safe_load(f))
+        data = yaml.safe_load(f)
+    return SN(**data)
 
-# ----------------- Dataset -----------------
-class FolderDataset(Dataset):
-    def __init__(self, root, captions=None, size=512):
-        self.paths = [str(p) for p in pathlib.Path(root).glob("*") if p.suffix.lower() in {".jpg",".jpeg",".png"}]
+def set_seed(seed: int):
+    if seed is None or int(seed) == 0:  # 0 oder None = random
+        seed = int(time.time()) % 2_000_000_000
+    random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    return seed
+
+def ensure_dir(p: str | Path):
+    Path(p).mkdir(parents=True, exist_ok=True)
+
+def save_config_copy(cfg: SN, out_dir: Path):
+    ensure_dir(out_dir)
+    with open(out_dir / "config_used.json", "w") as f:
+        json.dump(vars(cfg), f, indent=2, ensure_ascii=False)
+
+# ----------------------------
+# Dataset (einfach: Ordner mit JPG/PNG)
+# ----------------------------
+
+class ImageFolderDataset(Dataset):
+    def __init__(self, root, size=512):
+        self.root = Path(root)
         self.size = size
-        self.caps = {}
-        if captions and pathlib.Path(captions).exists():
-            with open(captions, "r") as f:
-                for line in f:
-                    line=line.strip()
-                    if not line: continue
-                    if ":" in line:
-                        k,v = line.split(":",1)
-                        self.caps[k.strip()] = v.strip()
-        random.shuffle(self.paths)
-    def __len__(self): return len(self.paths)
+        self.paths = sorted([p for p in self.root.rglob("*") if p.suffix.lower() in [".png", ".jpg", ".jpeg"]])
+        if len(self.paths) == 0:
+            raise RuntimeError(f"Keine Trainingsbilder gefunden in: {self.root}")
+
+    def __len__(self):
+        return len(self.paths)
+
     def __getitem__(self, idx):
         p = self.paths[idx]
-        im = Image.open(p).convert("RGB").resize((self.size,self.size), Image.BICUBIC)
-        t = torch.tensor(list(im.getdata()), dtype=torch.uint8).view(self.size,self.size,3).permute(2,0,1)/255.0
-        name = pathlib.Path(p).name
-        cap = self.caps.get(name, None)
-        return t, cap
+        im = Image.open(p).convert("RGB")
+        im = im.resize((self.size, self.size), Image.BICUBIC)
+        im = torch.from_numpy((torch.ByteTensor(torch.ByteStorage.from_buffer(im.tobytes()))
+                               .view(self.size, self.size, 3)
+                               .float() / 255.0).numpy())  # (H,W,3) float
+        im = im.permute(2, 0, 1) * 2 - 1  # [-1,1] und nach (C,H,W)
+        return {"pixel_values": im}
 
-# ----------------- LoRA utils -----------------
-def inject_lora_unet(pipe, rank=16, alpha=16, target_modules=()):
-    from peft import LoraConfig, get_peft_model
-    import torch.nn as nn
+# ----------------------------
+# LoRA an UNet hängen
+# ----------------------------
 
-    # Tiny adapter for linear layers
-    def _wrap(module: nn.Module, name: str):
-        m = getattr(module, name)
-        in_f, out_f = m.in_features, m.out_features
-        A = nn.Linear(in_f, rank, bias=False)
-        B = nn.Linear(rank, out_f, bias=False)
-        nn.init.kaiming_uniform_(A.weight, a=math.sqrt(5))
-        nn.init.zeros_(B.weight)
-        m.forward_orig = m.forward
-        def fwd(x):
-            return m.forward_orig(x) + B(A(x)) * (alpha/rank)
-        m.forward = fwd
+def add_lora_to_unet(unet, r=16, alpha=16):
+    lora_attn_procs = {}
+    for name, module in unet.named_modules():
+        if hasattr(module, "set_processor"):
+            lora_attn_procs[name] = LoRAAttnProcessor(hidden_size=module.to_q.in_features, rank=r)
+    unet.set_attn_processor(lora_attn_procs)
+    # Parameter-Container, damit wir nur LoRA-Gewichte optimieren
+    trainable = AttnProcsLayers(unet.attn_processors)
+    for p in trainable.parameters():
+        p.requires_grad_(True)
+    return trainable
 
-    for n, m in pipe.unet.named_modules():
-        if any(n.endswith(t) for t in target_modules):
-            if hasattr(m, "in_features") and hasattr(m, "out_features"):
-                parent_name = ".".join(n.split(".")[:-1])
-                last = n.split(".")[-1]
-                parent = pipe.unet.get_submodule(parent_name) if parent_name else pipe.unet
-                _wrap(parent, last)
-    return pipe
+# ----------------------------
+# Training
+# ----------------------------
 
-# ----------------- Train loop (simplified) -----------------
-def train(cfg: Cfg):
-    torch.manual_seed(cfg.seed)
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+def train(cfg: SN):
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    dtype = torch.float16 if str(getattr(cfg, "mixed_precision", "fp16")).lower() == "fp16" and torch.cuda.is_available() else torch.float32
 
+    print(">> Lade Pipeline …")
     pipe = StableDiffusionPipeline.from_pretrained(
-        cfg.base_model, torch_dtype=torch.float16 if device=="cuda" else torch.float32
-    ).to(device)
-    pipe = inject_lora_unet(pipe, cfg.lora_rank, cfg.lora_alpha, cfg.lora_target_modules)
+        cfg.base_model,
+        torch_dtype=dtype
+    )
+    pipe.to(device)
+    pipe.enable_xformers_memory_efficient_attention() if hasattr(pipe, "enable_xformers_memory_efficient_attention") else None
 
-    ds = FolderDataset(cfg.train_images, cfg.caption_file, cfg.resolution)
-    dl = DataLoader(ds, batch_size=cfg.batch_size, shuffle=True, drop_last=True)
+    vae: AutoencoderKL = pipe.vae
+    text_encoder: CLIPTextModel = pipe.text_encoder
+    tokenizer: CLIPTokenizer = pipe.tokenizer
+    unet = pipe.unet
+    noise_scheduler = DDPMScheduler.from_config(pipe.scheduler.config)
 
-    # Dummy optimizer (we only update injected LoRA weights via patch above)
-    opt = torch.optim.AdamW([p for p in pipe.unet.parameters() if p.requires_grad], lr=cfg.learning_rate)
-    sch = get_scheduler(cfg.lr_scheduler, optimizer=opt, num_warmup_steps=0, num_training_steps=cfg.max_train_steps)
+    # LoRA nur auf die UNet-Attention trainieren
+    trainable = add_lora_to_unet(unet, r=int(getattr(cfg, "lora_rank", 16)), alpha=int(getattr(cfg, "lora_alpha", 16)))
+    optimizer = torch.optim.AdamW(trainable.parameters(), lr=float(getattr(cfg, "lr", 1e-4)))
 
-    out = pathlib.Path(cfg.output_dir); out.mkdir(parents=True, exist_ok=True)
-    step = 0
-    pipe.unet.train()
-    while step < cfg.max_train_steps:
-        for batch, caps in dl:
-            if step >= cfg.max_train_steps: break
-            batch = batch.to(device, dtype=torch.float16 if device=="cuda" else torch.float32)
-            # self-supervised noise prediction (very simplified example)
-            noise = torch.randn_like(batch)
-            loss = (batch - noise).abs().mean()  # placeholder loss
+    # Dataset & Loader
+    print(">> Baue Dataset …")
+    ds = ImageFolderDataset(cfg.train_images, size=int(getattr(cfg, "resolution", 512)))
+    dl = DataLoader(ds, batch_size=int(getattr(cfg, "batch_size", 1)), shuffle=True, num_workers=0, drop_last=True)
+
+    # Prompt-Handling (ein globaler Stil-Prefix funktioniert für LoRA erstaunlich gut)
+    prompt_prefix = getattr(cfg, "prompt_prefix", "")
+    tokens = tokenizer([prompt_prefix] * int(getattr(cfg, "batch_size", 1)), padding="max_length", max_length=tokenizer.model_max_length, return_tensors="pt").input_ids.to(device)
+
+    out_dir = Path(getattr(cfg, "output_dir", "runs/lora_out"))
+    ensure_dir(out_dir)
+    save_every = int(getattr(cfg, "save_every_steps", 200))
+    max_steps = int(getattr(cfg, "max_train_steps", 800))
+
+    print(f">> Starte Training: {len(ds)} Bilder, steps={max_steps}, save_every={save_every}")
+    global_step = 0
+    unet.train()
+    text_encoder.eval()
+    vae.eval()
+
+    for epoch in range(10_000):  # wird über steps begrenzt
+        for batch in dl:
+            global_step += 1
+            pixel_values = batch["pixel_values"].to(device, dtype=dtype)
+
+            # 1) zu latents
+            with torch.no_grad():
+                latents = vae.encode(pixel_values).latent_dist.sample() * vae.config.scaling_factor
+
+            # 2) Noise addieren
+            noise = torch.randn_like(latents)
+            timesteps = torch.randint(0, noise_scheduler.config.num_train_timesteps, (latents.shape[0],), device=device).long()
+            noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
+
+            # 3) Text-Embeddings
+            with torch.no_grad():
+                encoder_hidden_states = text_encoder(tokens)[0]
+
+            # 4) UNet vorwärts
+            noise_pred = unet(noisy_latents, timesteps, encoder_hidden_states).sample
+
+            # 5) Loss = MSE zwischen predicted noise und echter noise
+            loss = nn.functional.mse_loss(noise_pred.float(), noise.float())
+
+            optimizer.zero_grad(set_to_none=True)
             loss.backward()
-            if (step+1) % cfg.gradient_accumulation == 0:
-                opt.step(); sch.step(); opt.zero_grad(set_to_none=True)
-            step += 1
-            if step % 50 == 0:
-                print(f"step {step}/{cfg.max_train_steps} loss={float(loss):.4f}")
-            if step % cfg.save_every_steps == 0:
-                ck = out / f"checkpoint-{step}"
-                ck.mkdir(parents=True, exist_ok=True)
-                pipe.save_pretrained(ck)
+            optimizer.step()
 
-    # final save
-    pipe.save_pretrained(out)
-    return str(out)
+            if global_step % 10 == 0:
+                print(f"[{global_step:05d}/{max_steps}] loss={loss.item():.4f}")
 
-# ----------------- HF upload helpers -----------------
-def _pick_best_or_last_checkpoint(output_dir: str) -> str:
-    out = pathlib.Path(output_dir)
-    ckpts = sorted([p for p in out.glob("checkpoint-*") if p.is_dir()],
-                   key=lambda p: int(re.findall(r"checkpoint-(\d+)", p.name)[0]) if re.findall(r"checkpoint-(\d+)", p.name) else -1)
-    if ckpts: return str(ckpts[-1])
-    return str(out)
+            # Checkpoint speichern?
+            if global_step % save_every == 0 or global_step == max_steps:
+                ckpt_dir = out_dir / f"step_{global_step:06d}"
+                ensure_dir(ckpt_dir)
+                # Nur LoRA-Gewichte sichern
+                trainable.save_pretrained(ckpt_dir)
+                with open(ckpt_dir / "meta.json", "w") as f:
+                    json.dump({"step": global_step, "loss": float(loss.item())}, f, indent=2)
+                print(f"💾 Checkpoint gespeichert: {ckpt_dir}")
 
-def _ensure_repo(api: HfApi, repo_id: str, private=True):
-    try: api.repo_info(repo_id)
-    except Exception: api.create_repo(repo_id, private=private, repo_type="model")
+            if global_step >= max_steps:
+                break
+        if global_step >= max_steps:
+            break
 
-def upload_to_hub(folder: str, repo_id: str, msg="auto: upload"):
-    token = HfFolder.get_token()
-    if not token: raise RuntimeError("HF-Token fehlt. HfFolder.save_token(<TOKEN>) ausführen.")
-    api = HfApi(token=token)
-    _ensure_repo(api, repo_id, private=True)
-    api.upload_folder(folder_path=folder, repo_id=repo_id, repo_type="model",
-                      commit_message=msg, ignore_patterns=["*.png","*.jpg","wandb/**","tensorboard/**"])
-    print(f"✅ Upload fertig: https://huggingface.co/{repo_id}")
+    print("✅ Training fertig.")
+    print(f"➡️  Alle Checkpoints liegen in: {out_dir}")
+    return str(out_dir)
 
-# ----------------- Main -----------------
+# ----------------------------
+# CLI
+# ----------------------------
+
 def main():
-    import argparse, yaml
     ap = argparse.ArgumentParser()
-    ap.add_argument("--config", type=str, required=True)
-    ap.add_argument("--repo_name", type=str, default="comic-real-lora")
+    ap.add_argument("--config", type=str, required=True, help="Pfad zu YAML (z. B. configs/train_smoke.yaml)")
     args = ap.parse_args()
 
     cfg = load_yaml(args.config)
-    out_dir = train(cfg)
-
-    best = _pick_best_or_last_checkpoint(out_dir)
-    user = whoami(HfFolder.get_token())["name"] if HfFolder.get_token() else "user"
-    repo_id = f"{user}/{args.repo_name}"
-    try:
-        upload_to_hub(best, repo_id, msg=f"upload from {args.config}")
-    except Exception as e:
-        print("⚠️ Upload übersprungen/fehlgeschlagen:", e)
+    cfg.seed = set_seed(getattr(cfg, "seed", 0))
+    ensure_dir(getattr(cfg, "output_dir", "runs/lora_out"))
+    save_config_copy(cfg, Path(cfg.output_dir))
+    train(cfg)
 
 if __name__ == "__main__":
     main()
