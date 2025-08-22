@@ -1,0 +1,18 @@
+base_model: runwayml/stable-diffusion-v1-5
+train_images: data/real_style/images   # dein Bilder-Ordner
+resolution: 512
+max_train_steps: 120
+batch_size: 1
+gradient_accumulation: 1
+mixed_precision: fp16
+save_every_steps: 40
+output_dir: runs/real_smoke
+seed: 123
+
+# LoRA-Parameter
+lora_rank: 16
+lora_alpha: 16
+lr: 1e-4
+
+# Prompt
+prompt_prefix: "photo, instagram style"
