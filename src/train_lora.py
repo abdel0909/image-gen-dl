@@ -1,286 +1,270 @@
-# src/train_lora.py  —  komplett neu (Drop-in)
-# Minimaler LoRA-Trainer für SD v1.5 (robustes YAML, Captions optional, Checkpoints)
-import os, math, argparse, json, time, random
+# src/train_lora.py — minimaler, robuster LoRA-Trainer für SD v1.5 (Diffusers)
+# Läuft mit: configs/train_smoke.yaml oder configs/train_real.yaml
+import os, sys, math, json, time, argparse, socket, random, shutil
 from pathlib import Path
 from types import SimpleNamespace
 
 import torch
 from torch import nn
 from torch.utils.data import Dataset, DataLoader
-from PIL import Image
+from torchvision import transforms
+from PIL import Image, ImageDraw
+
 import yaml
 
-from diffusers import (
-    StableDiffusionPipeline,
-    DDPMScheduler,
-)
+from diffusers import StableDiffusionPipeline, DDPMScheduler
 from diffusers.models.attention_processor import LoRAAttnProcessor
-from torchvision import transforms as T
 
+# ----------------------------- Utils -----------------------------
 
-# ---------- Utils ----------
-
-def load_cfg(path: str) -> SimpleNamespace:
-    """YAML -> Namespace, mit sinnvollen Defaults. 'caption_file' ist optional."""
+def load_yaml_namespace(path: str) -> SimpleNamespace:
     with open(path, "r") as f:
         data = yaml.safe_load(f) or {}
-
-    # Defaults
-    data.setdefault("base_model", "runwayml/stable-diffusion-v1-5")
-    data.setdefault("train_images", "data/real_style/images")
-    data.setdefault("caption_file", None)          # <- wichtig: optional!
-    data.setdefault("resolution", 512)
-    data.setdefault("max_train_steps", 200)
-    data.setdefault("batch_size", 1)
-    data.setdefault("gradient_accumulation", 1)
-    data.setdefault("mixed_precision", "fp16")
-    data.setdefault("save_every_steps", 100)
-    data.setdefault("output_dir", "runs/real_lora")
-    data.setdefault("seed", 123)
-    data.setdefault("lora_rank", 16)
-    data.setdefault("lr", 1e-4)
-    data.setdefault("prompt_prefix", "")
-
-    # Pfade normieren
-    data["train_images"]  = str(Path(data["train_images"]))
-    if data["caption_file"]:
-        data["caption_file"] = str(Path(data["caption_file"]))
-    data["output_dir"]   = str(Path(data["output_dir"]))
-
     return SimpleNamespace(**data)
 
+def ensure_dir(p: str | Path) -> Path:
+    p = Path(p)
+    p.mkdir(parents=True, exist_ok=True)
+    return p
 
-class ImageCaptionDataset(Dataset):
-    def __init__(self, img_dir: str, caption_file: str | None, prompt_prefix: str = "", size: int = 512):
-        self.paths = []
-        for ext in ("*.png", "*.jpg", "*.jpeg", "*.webp"):
-            self.paths.extend(sorted(Path(img_dir).glob(ext)))
-        if not self.paths:
-            raise FileNotFoundError(f"Keine Trainingsbilder in {img_dir} gefunden.")
+def print_kv(title: str, d: dict):
+    print(f"\n== {title} ==")
+    for k, v in d.items():
+        print(f"{k:>18}: {v}")
 
+# ----------------------------- Dataset -----------------------------
+
+class ImageCaptionFolder(Dataset):
+    def __init__(self, img_dir: str, caption_file: str | None = None, size: int = 512):
+        self.img_dir = Path(img_dir)
         self.size = size
-        self.prompt_prefix = prompt_prefix.strip() if prompt_prefix else ""
+
+        exts = (".png", ".jpg", ".jpeg", ".webp")
+        self.paths = sorted([p for p in self.img_dir.glob("*") if p.suffix.lower() in exts])
 
         self.captions = {}
         if caption_file and Path(caption_file).exists():
-            # eine Zeile pro Bildname:  '0001.png: eine beschreibung ...'
-            with open(caption_file, "r", encoding="utf-8", errors="ignore") as f:
-                for line in f:
-                    line = line.strip()
-                    if not line or ":" not in line:
-                        continue
-                    name, cap = line.split(":", 1)
-                    self.captions[name.strip()] = cap.strip()
+            with open(caption_file, "r", encoding="utf-8") as f:
+                lines = [l.strip() for l in f.readlines()]
+            # map sequentially by filename order
+            for i, p in enumerate(self.paths):
+                if i < len(lines) and lines[i]:
+                    self.captions[p.name] = lines[i]
 
-        self.tf = T.Compose([
-            T.Resize(self.size, interpolation=T.InterpolationMode.BILINEAR),
-            T.CenterCrop(self.size),
-            T.ToTensor(),
-            T.Normalize([0.5], [0.5])
+        self.tfm = transforms.Compose([
+            transforms.Resize(size, interpolation=transforms.InterpolationMode.BICUBIC),
+            transforms.CenterCrop(size),
+            transforms.ToTensor(),
+            transforms.Normalize([0.5], [0.5])
         ])
 
-    def __len__(self): return len(self.paths)
+    def __len__(self):
+        return len(self.paths)
 
     def __getitem__(self, idx):
         p = self.paths[idx]
-        img = Image.open(p).convert("RGB")
-        pixel = self.tf(img)
+        im = Image.open(p).convert("RGB")
+        im = self.tfm(im)
+        cap = self.captions.get(p.name, "")
+        return {"pixel_values": im, "text": cap}
 
-        # Caption: aus Datei, sonst Dateiname, optional Prefix voranstellen
-        base = p.name
-        cap = self.captions.get(base, Path(base).stem.replace("_", " ").replace("-", " "))
-        if self.prompt_prefix:
-            cap = f"{self.prompt_prefix} {cap}".strip()
+def maybe_make_dummy_images(img_dir: Path, n=60, size=512):
+    img_dir = ensure_dir(img_dir)
+    exts = (".png", ".jpg", ".jpeg", ".webp")
+    existing = [p for p in img_dir.glob("*") if p.suffix.lower() in exts]
+    if len(existing) > 0:
+        return len(existing)
 
-        return {"pixel_values": pixel, "caption": cap}
+    print("🧪 Kein Datensatz gefunden → erzeuge Dummy-Bilder …")
+    rng = random.Random(123)
+    for i in range(n):
+        im = Image.new("RGB", (size, size), (rng.randint(0,255), rng.randint(0,255), rng.randint(0,255)))
+        dr = ImageDraw.Draw(im)
+        # einfache Formen, damit es "echter" wirkt
+        for _ in range(6):
+            x0, y0 = rng.randint(10, size-150), rng.randint(10, size-150)
+            x1, y1 = x0 + rng.randint(60, 200), y0 + rng.randint(60, 200)
+            dr.rectangle([x0, y0, x1, y1], outline=(0,0,0), width=4)
+        im.save(img_dir / f"{i:04d}.png")
+    return n
 
+# ----------------------------- LoRA Attach -----------------------------
 
-# ---------- LoRA Setup ----------
-def add_lora_to_unet(unet, rank=16):
+def attach_lora(unet, rank=16):
     """
-    Hängt LoRA-Prozessoren an alle Attention-Module im UNet.
-    Diffusers >=0.20: LoRAAttnProcessor(hidden_size, cross_attention_dim, rank).
-    Wir ermitteln hidden_size heuristisch über die Namenskonventionen.
+    Hängt LoRA-Schichten an alle Attention-Module des UNet.
+    Aktuelle diffusers erwartet 'hidden_dim' (nicht mehr 'hidden_size').
     """
-    unet.requires_grad_(False)
-    lora_attn_procs = {}
-    # Mapping der Block-Kanäle (hidden sizes) gemäß UNet-Konfig
-    block_out = list(unet.config.block_out_channels)
-    cross_dim = unet.config.cross_attention_dim
-
-    def hidden_from_name(name: str) -> int:
-        # name z.B. "down_blocks.0.attentions.0.transformer_blocks.0.attn1.processor"
-        if name.startswith("down_blocks"):
-            idx = int(name.split(".")[1])
-            return block_out[idx]
-        if name.startswith("up_blocks"):
-            idx = int(name.split(".")[1])
-            # up-blocks laufen in umgekehrter Reihenfolge
-            return block_out[::-1][idx]
-        # mid_block
-        return block_out[-1]
-
-    for name, module in unet.attn_processors.items():
-        hidden_size = hidden_from_name(name)
-        lora_attn_procs[name] = LoRAAttnProcessor(
-            hidden_size=hidden_size,
+    procs = {}
+    for name, attn in unet.attn_processors.items():
+        # attn1 = self-attn, kein cross_dim
+        cross_dim = None if name.endswith("attn1.processor") else unet.config.cross_attention_dim
+        # neues Attribut in aktuellen Versionen:
+        hidden_dim = getattr(attn, "hidden_size", None)
+        if hidden_dim is None:
+            # Fallback: viele Module haben 'to_q' mit in_features
+            try:
+                hidden_dim = attn.to_q.in_features  # best effort fallback
+            except Exception:
+                hidden_dim = unet.config.block_out_channels[-1]
+        procs[name] = LoRAAttnProcessor(
+            hidden_dim=hidden_dim,
             cross_attention_dim=cross_dim,
             rank=rank
         )
+    unet.set_attn_processor(procs)
+    return unet
 
-    unet.set_attn_processor(lora_attn_procs)
-    # trainierbare LoRA-Parameter freischalten
-    trainable = []
-    for _, p in unet.attn_processors.items():
-        if hasattr(p, "to_q_lora"):
-            trainable += list(p.parameters())
-    for p in trainable:
-        p.requires_grad_(True)
-    return trainable
+def lora_parameters(unet):
+    for _, module in unet.attn_processors.items():
+        for name, p in module.named_parameters():
+            if "lora_" in name and p.requires_grad:
+                yield p
 
+# ----------------------------- Training -----------------------------
 
-# ---------- Training ----------
-def train(cfg: SimpleNamespace):
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    torch.manual_seed(int(cfg.seed))
-    random.seed(int(cfg.seed))
+def train(cfg_path: str):
+    cfg = load_yaml_namespace(cfg_path)
 
-    out_dir = Path(cfg.output_dir)
-    out_dir.mkdir(parents=True, exist_ok=True)
+    # Defaults
+    base_model = getattr(cfg, "base_model", "runwayml/stable-diffusion-v1-5")
+    image_dir  = getattr(cfg, "train_images", "data/real_style/images")
+    caption    = getattr(cfg, "caption_file", None)  # darf fehlen
+    out_dir    = getattr(cfg, "output_dir", "runs/real_lora")
+    resolution = int(getattr(cfg, "resolution", 512))
+    steps      = int(getattr(cfg, "max_train_steps", 800))
+    bs         = int(getattr(cfg, "batch_size", 1))
+    grad_acc   = int(getattr(cfg, "gradient_accumulation", 1))
+    lr         = float(getattr(cfg, "lr", 1e-4))
+    rank       = int(getattr(cfg, "lora_rank", 16))
+    save_every = int(getattr(cfg, "save_every_steps", max(steps//5, 50)))
+    seed       = int(getattr(cfg, "seed", 123))
 
-    # Config-Kopie mitschreiben
-    with open(out_dir / "config_used.yaml", "w") as f:
-        yaml.safe_dump(json.loads(json.dumps(cfg.__dict__)), f, sort_keys=False, allow_unicode=True)
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    torch.manual_seed(seed)
 
-    # Pipeline + Scheduler
-    dtype = torch.float16 if cfg.mixed_precision.lower() in ("fp16", "float16") else torch.float32
+    ensure_dir(out_dir)
+
+    print_kv("Config", {
+        "base_model": base_model, "image_dir": image_dir, "caption_file": caption or "(keine)",
+        "output_dir": out_dir, "resolution": resolution, "steps": steps,
+        "batch_size": bs, "grad_acc": grad_acc, "lr": lr, "rank": rank,
+        "device": device
+    })
+
+    # Daten sicherstellen (Dummy, falls leer)
+    img_dir = Path(image_dir)
+    n_imgs = maybe_make_dummy_images(img_dir, n=60, size=resolution)
+    print(f"✅ Trainingsbilder: {n_imgs}")
+
+    # Pipeline
     pipe = StableDiffusionPipeline.from_pretrained(
-        cfg.base_model,
-        torch_dtype=dtype,
+        base_model,
+        torch_dtype=torch.float16 if device == "cuda" else torch.float32,
         safety_checker=None
-    ).to(device)
-    pipe.enable_xformers_memory_efficient_attention() if hasattr(pipe, "enable_xformers_memory_efficient_attention") else None
+    )
+    pipe.scheduler = DDPMScheduler.from_config(pipe.scheduler.config)
+    pipe.to(device)
 
-    # Datensatz
-    ds = ImageCaptionDataset(cfg.train_images, cfg.caption_file, cfg.prompt_prefix, cfg.resolution)
-    dl = DataLoader(ds, batch_size=int(cfg.batch_size), shuffle=True, drop_last=True)
+    # LoRA anhängen
+    attach_lora(pipe.unet, rank=rank)
+    # Nur LoRA-Parameter trainieren
+    for p in pipe.unet.parameters():
+        p.requires_grad_(False)
+    for p in lora_parameters(pipe.unet):
+        p.requires_grad_(True)
 
-    # Noise-Scheduler (DDPM -> wie bei SD)
-    noise_scheduler = DDPMScheduler.from_pretrained(cfg.base_model, subfolder="scheduler")
+    # Dataset & Loader
+    ds = ImageCaptionFolder(image_dir, caption_file=caption, size=resolution)
+    if len(ds) == 0:
+        raise RuntimeError("Kein einziges Trainingsbild gefunden.")
+    dl = DataLoader(ds, batch_size=bs, shuffle=True, drop_last=True)
 
-    # LoRA an UNet hängen
-    trainable_params = add_lora_to_unet(pipe.unet, rank=int(cfg.lora_rank))
-    optimizer = torch.optim.AdamW(trainable_params, lr=float(cfg.lr))
+    # Optimizer
+    opt = torch.optim.AdamW(lora_parameters(pipe.unet), lr=lr)
 
-    global_step = 0
+    scaler = torch.cuda.amp.GradScaler(enabled=(device=="cuda"))
+    autocast = torch.cuda.amp.autocast if device=="cuda" else torch.autocast  # type: ignore
+
+    # Text-Encoder & VAE im eval, nur UNet LoRA trainieren
+    pipe.text_encoder.eval()
+    pipe.vae.eval()
     pipe.unet.train()
 
-    print(f"🚀 Start — steps={cfg.max_train_steps}, save_every={cfg.save_every_steps}, "
-          f"batch={cfg.batch_size}, imgs={len(ds)}")
+    global_step = 0
+    best_loss = float("inf")
     last_save = 0
-    accum = int(cfg.gradient_accumulation)
 
-    while global_step < int(cfg.max_train_steps):
+    # Trainings-Schleife
+    while global_step < steps:
         for batch in dl:
-            pixel_values = batch["pixel_values"].to(device=device, dtype=dtype)
-            prompts = batch["caption"]
-
-            # 1) Text-Encoder
-            with torch.no_grad():
-                text_inp = pipe.tokenizer(
-                    list(prompts), padding="max_length",
-                    truncation=True, max_length=pipe.tokenizer.model_max_length,
-                    return_tensors="pt"
-                )
-                text_inp = {k: v.to(device) for k, v in text_inp.items()}
-                enc_out = pipe.text_encoder(**text_inp)
-                text_embeds = enc_out[0]
-
-            # 2) VAE-Encode -> latents
-            with torch.no_grad():
-                latents = pipe.vae.encode(pixel_values).latent_dist.sample()
-                latents = latents * pipe.vae.config.scaling_factor
-
-            # 3) Noise hinzufügen
-            noise = torch.randn_like(latents)
-            timesteps = torch.randint(0, noise_scheduler.config.num_train_timesteps, (latents.shape[0],), device=device).long()
-            noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
-
-            # 4) Vorhersage
-            model_pred = pipe.unet(noisy_latents, timesteps, encoder_hidden_states=text_embeds).sample
-
-            # 5) Ziel (eps)
-            target = noise
-
-            loss = nn.functional.mse_loss(model_pred.float(), target.float(), reduction="mean") / accum
-            loss.backward()
-
-            if (global_step + 1) % accum == 0:
-                optimizer.step()
-                optimizer.zero_grad(set_to_none=True)
-
-            if (global_step + 1) % int(cfg.save_every_steps) == 0:
-                ckpt = out_dir / f"step_{global_step+1}.safetensors"
-                save_lora(pipe.unet, ckpt)
-                print(f"💾 checkpoint: {ckpt}")
-                last_save = global_step + 1
-
-            global_step += 1
-            if global_step >= int(cfg.max_train_steps):
+            if global_step >= steps:
                 break
 
-    # Ende: letztes/bestes speichern (falls nicht gerade gespeichert)
-    if last_save != global_step:
-        ckpt = out_dir / f"step_{global_step}.safetensors"
-        save_lora(pipe.unet, ckpt)
-        print(f"✅ fertig — letzter checkpoint: {ckpt}")
+            images = batch["pixel_values"].to(device)
+            prompts = batch["text"]
 
-    return str(out_dir)
+            # Encode latents
+            with torch.no_grad():
+                latents = pipe.vae.encode(images).latent_dist.sample() * 0.18215
+                if prompts and any(prompts):
+                    enc = pipe.tokenizer(prompts, padding="max_length", max_length=pipe.tokenizer.model_max_length, truncation=True, return_tensors="pt")
+                else:
+                    enc = pipe.tokenizer([""] * images.size(0), padding="max_length", max_length=pipe.tokenizer.model_max_length, return_tensors="pt")
+                enc = {k: v.to(device) for k, v in enc.items()}
+                cond = pipe.text_encoder(**enc).last_hidden_state
 
+                noise = torch.randn_like(latents)
+                timesteps = torch.randint(0, pipe.scheduler.config.num_train_timesteps, (latents.size(0),), device=device, dtype=torch.long)
+                noisy_latents = pipe.scheduler.add_noise(latents, noise, timesteps)
 
-def save_lora(unet, path: Path):
-    """
-    Speichert nur die LoRA-Gewichte aus den Attention-Prozessoren
-    als .safetensors-Datei (klein). Läuft ohne zusätzliche Abhängigkeiten.
-    """
-    try:
-        from safetensors.torch import save_file
-    except Exception:
-        # Fallback auf torch.save
-        def save_file(state, p): torch.save(state, p)
+            with torch.cuda.amp.autocast(enabled=(device=="cuda")):
+                model_pred = pipe.unet(noisy_latents, timesteps, encoder_hidden_states=cond).sample
+                loss = nn.functional.mse_loss(model_pred, noise, reduction="mean") / grad_acc
 
-    state = {}
-    for name, proc in unet.attn_processors.items():
-        # LoRAAttnProcessor hat A/B-Matrizen: to_q_lora, to_k_lora, ...
-        for attr in ["to_q_lora", "to_k_lora", "to_v_lora", "to_out_lora"]:
-            if hasattr(proc, attr):
-                lora = getattr(proc, attr)
-                state[f"{name}.{attr}.up.weight"] = lora.up.weight.detach().cpu()
-                state[f"{name}.{attr}.down.weight"] = lora.down.weight.detach().cpu()
-                if hasattr(lora, "alpha"):
-                    state[f"{name}.{attr}.alpha"] = torch.tensor(float(lora.alpha))
-    path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    # wenn safetensors verfügbar:
-    try:
-        from safetensors.torch import save_file as _save
-        _save(state, str(path))
-    except Exception:
-        torch.save(state, str(path))
+            scaler.scale(loss).backward()
 
+            if (global_step + 1) % grad_acc == 0:
+                scaler.step(opt)
+                scaler.update()
+                opt.zero_grad(set_to_none=True)
 
-# ---------- CLI ----------
+            global_step += 1
+
+            if global_step % 10 == 0 or global_step == 1:
+                print(f"step {global_step:05d}/{steps}  loss={loss.item()*grad_acc:.4f}")
+
+            # Speichern
+            if global_step - last_save >= save_every or global_step == steps:
+                ckpt_dir = ensure_dir(Path(out_dir) / f"step_{global_step:05d}")
+                # nur LoRA-Gewichte speichern
+                pipe.save_lora_weights(ckpt_dir)
+                # Config-Kopie mitschreiben
+                shutil.copy2(cfg_path, ckpt_dir / Path(cfg_path).name)
+                print(f"💾 Checkpoint gespeichert: {ckpt_dir}")
+                last_save = global_step
+
+                if loss.item() < best_loss:
+                    best_loss = loss.item()
+                    # best separat
+                    best_dir = ensure_dir(Path(out_dir) / "best")
+                    pipe.save_lora_weights(best_dir)
+                    shutil.copy2(cfg_path, best_dir / Path(cfg_path).name)
+                    print(f"⭐ Best aktualisiert (loss {best_loss*grad_acc:.4f})")
+
+    # Abschluss
+    final_dir = ensure_dir(Path(out_dir) / "final")
+    pipe.save_lora_weights(final_dir)
+    shutil.copy2(cfg_path, final_dir / Path(cfg_path).name)
+    print(f"\n✅ Fertig. Finale LoRA-Gewichte: {final_dir}")
+
+# ----------------------------- CLI -----------------------------
+
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--config", type=str, required=True, help="Pfad zur YAML-Config")
+    ap.add_argument("--config", required=True, help="Pfad zur YAML-Config")
     args = ap.parse_args()
-
-    cfg = load_cfg(args.config)
-    print("Config:", cfg.__dict__)
-
-    out = train(cfg)
-    print("Output:", out)
-
+    train(args.config)
 
 if __name__ == "__main__":
     main()
